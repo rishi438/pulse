@@ -1,6 +1,8 @@
 const { test, expect } = require("@playwright/test");
 
-const password = "PlaywrightPass123!";
+const password = process.env.PULSE_E2E_PASSWORD;
+const masterEmail = process.env.PULSE_MASTER_EMAIL;
+const masterPassword = process.env.PULSE_MASTER_PASSWORD;
 
 function customerEmail() {
   return `e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@pulse.local`;
@@ -81,18 +83,18 @@ test("Assistant saves a chat and restores it from the sidebar", async ({ page })
 });
 
 test("protected master account is marked in Management and cannot be deleted", async ({ page }) => {
-  await signIn(page, "master@pulse.local", "MasterPulse!2026");
+  await signIn(page, masterEmail, masterPassword);
   await expect(page.getByRole("button", { name: "Management" })).toBeVisible();
   await page.getByRole("button", { name: "Management" }).click();
   await page.getByRole("button", { name: "User management" }).click();
 
-  await expect(page.getByText("master@pulse.local is permanently protected.")).toBeVisible();
+  await expect(page.getByText(`${masterEmail} is permanently protected.`)).toBeVisible();
 
-  const deleteStatus = await page.evaluate(async () => {
+  const deleteStatus = await page.evaluate(async protectedEmail => {
     const token = localStorage.getItem("pulse-token");
     const overview = await fetch("/api/admin/overview", { headers: { Authorization: `Bearer ${token}` } }).then(response => response.json());
-    const master = overview.users.find(user => user.email === "master@pulse.local");
+    const master = overview.users.find(user => user.email === protectedEmail);
     return fetch(`/api/users/${master.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }).then(response => response.status);
-  });
+  }, masterEmail);
   expect(deleteStatus).toBe(403);
 });

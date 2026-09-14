@@ -31,6 +31,7 @@ wheels/
 memory.md
 
 # Virtual Environment
+.venv/
 venv/
 ENV/
 env/
@@ -39,6 +40,9 @@ env/
 .env
 .env.*
 !.env.local.example
+
+# Docker Compose secrets (generated locally)
+secrets/*
 # .env.local.example should be committed — it contains only placeholders
 
 # User-uploaded resume files (local dev)

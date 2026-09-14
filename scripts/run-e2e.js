@@ -1,10 +1,19 @@
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const http = require("node:http");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
 const python = process.platform === "win32" ? path.join(root, ".venv", "Scripts", "python.exe") : path.join(root, ".venv", "bin", "python");
-const environment = { ...process.env, OLLAMA_CHAT_URL: "http://127.0.0.1:9/api/chat", OLLAMA_TIMEOUT_SECONDS: "1" };
+const environment = {
+  ...process.env,
+  OLLAMA_CHAT_URL: "http://127.0.0.1:9/api/chat",
+  OLLAMA_TIMEOUT_SECONDS: "1",
+  PULSE_E2E_PASSWORD: process.env.PULSE_E2E_PASSWORD || crypto.randomBytes(24).toString("base64url"),
+  PULSE_MASTER_EMAIL: process.env.PULSE_MASTER_EMAIL || "e2e-master@pulse.local",
+  PULSE_MASTER_PASSWORD: process.env.PULSE_MASTER_PASSWORD || crypto.randomBytes(24).toString("base64url"),
+  PULSE_RESET_BOOTSTRAP_PASSWORDS: "true",
+};
 const server = spawn(python, ["-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8082"], { cwd: root, env: environment, stdio: "inherit", windowsHide: true });
 
 function waitForServer(remaining = 20) {

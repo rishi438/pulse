@@ -1,0 +1,70 @@
+name: pulse-markets
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pulsedb}
+      POSTGRES_USER: ${POSTGRES_USER:-pulse}
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    secrets:
+      - database_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-pulsedb}
+      PGUSER: ${POSTGRES_USER:-pulse}
+      DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      PULSE_MASTER_EMAIL: ${PULSE_MASTER_EMAIL:-master@pulse.local}
+      PULSE_MASTER_PASSWORD_FILE: /run/secrets/master_password
+      OLLAMA_CHAT_URL: http://ollama:11434/api/chat
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:20b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-90}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8081}:8081"
+    secrets:
+      - database_password
+      - master_password
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+secrets:
+  database_password:
+    file: ./secrets/postgres_password.txt
+  master_password:
+    file: ./secrets/master_password.txt
+
+volumes:
+  postgres_data:
+  ollama_data:

@@ -17,18 +17,39 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Pulse Markets API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://master%40pulse.local:MasterPulse!2026@127.0.0.1:5432/pulsedb")
+DATABASE_URL = os.getenv("DATABASE_URL")
 OLLAMA_CHAT_URL = os.getenv("OLLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
-MASTER = "master@pulse.local"
+MASTER = os.getenv("PULSE_MASTER_EMAIL", "master@pulse.local").strip().lower()
 ROLES = {"master": {"*"}, "admin": {"users:write", "roles:write", "permissions:write", "quotes:read", "trades:write"}, "analyst": {"quotes:read", "trades:write"}, "viewer": {"quotes:read", "trades:write"}, "customer": {"quotes:read", "trades:write"}}
 quotes = {"AAPL": {"name": "Apple Inc.", "price": 218.74, "open": 217.20}, "MSFT": {"name": "Microsoft Corp.", "price": 451.62, "open": 448.91}, "NVDA": {"name": "NVIDIA Corp.", "price": 141.93, "open": 143.26}, "TSLA": {"name": "Tesla Inc.", "price": 326.15, "open": 320.84}, "AMZN": {"name": "Amazon.com Inc.", "price": 227.88, "open": 226.44}}
+
+def secret_value(name):
+    value = os.getenv(name)
+    file_name = os.getenv(f"{name}_FILE")
+    if value and file_name: raise RuntimeError(f"Set either {name} or {name}_FILE, not both")
+    if file_name:
+        try: value = Path(file_name).read_text(encoding="utf-8").strip()
+        except OSError as error: raise RuntimeError(f"Could not read {name}_FILE") from error
+    return value.strip() if value else None
+
+def database_connection():
+    if DATABASE_URL: return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    options = {
+        "host": os.getenv("PGHOST", "127.0.0.1"),
+        "port": int(os.getenv("PGPORT", "5432")),
+        "dbname": os.getenv("PGDATABASE", "pulsedb"),
+        "user": os.getenv("PGUSER", "pulse"),
+    }
+    password = secret_value("DATABASE_PASSWORD")
+    if password: options["password"] = password
+    return psycopg.connect(row_factory=dict_row, **options)
 
 @contextmanager
 def db_connection():
     try:
-        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as db: yield db
+        with database_connection() as db: yield db
     except psycopg.OperationalError as error: raise HTTPException(503, "PostgreSQL is unavailable") from error
 
 def private_api(permission, summary):
@@ -253,7 +274,19 @@ def startup():
         for role,permissions in ROLES.items():
             db.execute("INSERT INTO roles(name,built_in) VALUES (%s,true) ON CONFLICT(name) DO NOTHING",(role,))
             for permission in permissions: db.execute("INSERT INTO role_permissions(role_name,permission) VALUES (%s,%s) ON CONFLICT DO NOTHING",(role,permission))
-        for email,password,role in [(MASTER,"MasterPulse!2026","master"),("admin@pulse.local","ChangeMe123!","admin")]:
-            if not db.execute("SELECT 1 FROM users WHERE lower(email)=lower(%s)",(email,)).fetchone():
-                uid=db.execute("INSERT INTO users(email,password_hash) VALUES (%s,%s) RETURNING id",(email,password_hash(password))).fetchone()["id"]; db.execute("INSERT INTO user_roles VALUES (%s,%s)",(uid,role)); db.execute("INSERT INTO portfolios VALUES (%s,100000)",(uid,))
+        bootstrap_users = [(MASTER, secret_value("PULSE_MASTER_PASSWORD"), "master")]
+        admin_email = os.getenv("PULSE_ADMIN_EMAIL", "").strip().lower()
+        if admin_email: bootstrap_users.append((admin_email, secret_value("PULSE_ADMIN_PASSWORD"), "admin"))
+        reset_passwords = os.getenv("PULSE_RESET_BOOTSTRAP_PASSWORDS", "").lower() in {"1", "true", "yes"}
+        for email,password,role in bootstrap_users:
+            if not password: continue
+            if len(password) < 12: raise RuntimeError(f"{role} bootstrap password must be at least 12 characters")
+            user = db.execute("SELECT id FROM users WHERE lower(email)=lower(%s)",(email,)).fetchone()
+            if user:
+                uid = user["id"]
+                if reset_passwords: db.execute("UPDATE users SET password_hash=%s WHERE id=%s",(password_hash(password),uid))
+            else:
+                uid=db.execute("INSERT INTO users(email,password_hash) VALUES (%s,%s) RETURNING id",(email,password_hash(password))).fetchone()["id"]
+            db.execute("INSERT INTO user_roles VALUES (%s,%s) ON CONFLICT DO NOTHING",(uid,role))
+            db.execute("INSERT INTO portfolios VALUES (%s,100000) ON CONFLICT DO NOTHING",(uid,))
 app.mount("/",StaticFiles(directory=Path(__file__).parent.parent/"web",html=True),name="web")
