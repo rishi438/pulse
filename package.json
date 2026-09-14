@@ -1,0 +1,14 @@
+{
+  "name": "pulse-markets-e2e",
+  "private": true,
+  "scripts": {
+    "test:e2e": "node scripts/run-e2e.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

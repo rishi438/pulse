@@ -1,0 +1,591 @@
+Podman on Windows / WSL2 - Problems and Fixes from This Conversation
+Date: 2026-08-09
+
+============================================================
+1. OLD / CURRENT PODMAN VHDX LOCATION
+============================================================
+
+Observed VHDX:
+C:\Users\AMD\.local\share\containers\podman\machine\wsl\wsldist\podman-machine-default\ext4.vhdx
+
+Observed size:
+1287651328 bytes (~1.20 GB)
+
+Conclusion:
+- This path looks like the active Podman machine disk.
+- Do NOT delete it unless you first confirm that podman-machine-default is not the active machine.
+
+Useful checks:
+podman machine list
+podman machine inspect
+
+Find all VHDX files:
+Get-ChildItem C:\Users\AMD -Recurse -Filter *.vhdx -ErrorAction SilentlyContinue |
+Select-Object FullName,@{N="SizeGB";E={[math]::Round($_.Length/1GB,2)}} |
+Sort-Object SizeGB -Descending
+
+
+============================================================
+2. ADMINER IMAGE / CONTAINER
+============================================================
+
+Pull Adminer:
+podman pull docker.io/library/adminer:latest
+
+Typical run:
+podman run -d `
+  --name adminer `
+  -p 8080:8080 `
+  docker.io/library/adminer:latest
+
+Observed later host-port mapping:
+0.0.0.0:8086->8080/tcp
+
+Meaning:
+Windows host port 8086 -> Adminer container port 8080
+
+Open:
+http://localhost:8086
+
+If localhost forwarding is broken, the WSL/Podman VM IP may work instead, for example:
+http://172.27.125.207:8086/
+
+
+============================================================
+3. POSTGRES CONTAINER / PORT CHECKS
+============================================================
+
+Observed PostgreSQL container:
+goofy_hodgkin
+
+Observed image:
+docker.io/library/postgres:18.4-alpine3.24
+
+Observed port mapping:
+0.0.0.0:5432->5432/tcp
+
+Check if Windows sees port 5432:
+Test-NetConnection 127.0.0.1 -Port 5432
+
+Confirmed result:
+TcpTestSucceeded : True
+
+Meaning:
+Windows -> localhost:5432 -> PostgreSQL was working.
+
+Useful PostgreSQL health checks:
+podman exec goofy_hodgkin pg_isready -U "master@pulse.local" -d pulsedb
+
+Actual SQL test:
+podman exec goofy_hodgkin psql -U "master@pulse.local" -d pulsedb -c "SELECT 1;"
+
+
+============================================================
+4. PODMAN NETWORKS
+============================================================
+
+Observed:
+podman network ls
+
+NETWORK ID    NAME        DRIVER
+68feb0ec6702  pgnet       bridge
+2f259bab93aa  podman      bridge
+
+pgnet inspection showed:
+- driver: bridge
+- subnet: 10.89.0.0/24
+- gateway: 10.89.0.1
+- dns_enabled: true
+
+Default "podman" network check:
+podman network inspect podman --format "{{.DNSEnabled}}"
+
+Confirmed result:
+false
+
+Important consequence:
+The default "podman" network did NOT provide container-name DNS resolution.
+
+That is why Adminer could not resolve the PostgreSQL container by name.
+
+
+============================================================
+5. ADMINER COULD NOT CONNECT TO POSTGRES BY CONTAINER NAME
+============================================================
+
+Observed containers:
+podman ps --format "table {{.Names}}\t{{.Networks}}\t{{.Ports}}"
+
+NAMES                  NETWORKS    PORTS
+goofy_hodgkin          podman      0.0.0.0:5432->5432/tcp
+mystifying_goldwasser  podman      0.0.0.0:8086->8080/tcp
+
+At first this looked like both were on the same network, which was true.
+But the default "podman" network had DNS disabled.
+
+Connectivity test from Adminer:
+podman exec mystifying_goldwasser php -r "var_dump(@fsockopen('goofy_hodgkin',5432));"
+
+Confirmed result:
+bool(false)
+
+DNS check:
+podman network inspect podman --format "{{.DNSEnabled}}"
+
+Confirmed result:
+false
+
+FIX:
+Attach both containers to pgnet because pgnet has DNS enabled.
+
+Commands:
+podman network connect pgnet goofy_hodgkin
+podman network connect pgnet mystifying_goldwasser
+
+Verify:
+podman ps --format "table {{.Names}}\t{{.Networks}}"
+
+DNS test:
+podman exec mystifying_goldwasser getent hosts goofy_hodgkin
+
+TCP test:
+podman exec mystifying_goldwasser php -r "var_dump(@fsockopen('goofy_hodgkin',5432));"
+
+Expected:
+resource(...) of type (stream)
+
+Adminer Server field should then be:
+goofy_hodgkin
+
+or:
+goofy_hodgkin:5432
+
+Do NOT use:
+localhost
+
+Reason:
+Inside the Adminer container, localhost means the Adminer container itself.
+
+
+============================================================
+6. PGNET EXISTED BUT NETAVARK / NFTABLES FAILED
+============================================================
+
+Observed error:
+netavark (exit code 1): nftables error:
+"nft" did not return successfully while applying ruleset
+
+This happened even with:
+podman run --rm --network pgnet alpine echo hello
+
+Meaning:
+The failure was not PostgreSQL-specific.
+The failure was in Podman/Netavark networking inside the Podman Linux VM.
+
+Attempted:
+podman network reload --all
+
+Result:
+Error: cannot use command "podman network reload" with the remote podman client
+
+Reason:
+On Windows, PowerShell Podman is a remote client talking to the Linux Podman machine.
+Some network-reload operations are not available through the remote client.
+
+Useful VM entry:
+podman machine ssh
+
+Useful inspection inside VM:
+sudo nft list ruleset
+nft --version
+podman --version
+netavark --version
+
+One safe restart sequence tried:
+podman machine stop
+wsl --shutdown
+podman machine start
+
+Important:
+We intentionally avoided blindly flushing nftables rules after realizing that could disrupt firewall/network state.
+
+
+============================================================
+7. HOST PORT PUBLISHED BUT WINDOWS LOCALHOST DID NOT WORK
+============================================================
+
+Observed:
+Adminer container was running:
+0.0.0.0:8080->8080/tcp
+and later:
+0.0.0.0:8086->8080/tcp
+
+The service worked inside the Podman VM/container, but Windows browser could not reach:
+http://localhost:8086
+
+The Podman VM had this eth0 address:
+172.27.125.207/20
+
+Command used inside Podman VM:
+ip -4 addr
+
+Important addresses observed:
+lo:
+127.0.0.1
+10.255.255.254
+
+eth0:
+172.27.125.207/20
+
+podman-usermode:
+192.168.127.2/24
+
+podman0:
+10.88.0.1/16
+
+Direct Windows access using the VM IP worked:
+http://172.27.125.207:8086/
+
+This proved:
+Container/service             = working
+Podman port publishing        = working inside WSL/VM
+Windows localhost forwarding  = the broken part
+
+
+============================================================
+8. WSLCONFIG
+============================================================
+
+Observed .wslconfig:
+[wsl2]
+memory = 8GB
+kernelCommandLine = vsyscall = emulate
+localhostForwarding=true
+
+This was already correct for normal WSL localhost forwarding.
+
+We temporarily tried:
+networkingMode=mirrored
+
+This caused a startup failure:
+
+wsl: The wsl2.localhostForwarding setting has no effect when using mirrored networking mode
+wsl: An internal error occurred.
+Error code: CreateInstance/CreateVm/ConfigureNetworking/0x8007054f
+wsl: Failed to configure network (networkingMode Mirrored), falling back to networkingMode None.
+cp: cannot stat '/mnt/wsl/resolv.conf': No such file or directory
+Error: error setting up user-mode networking ...
+
+FIX:
+Remove:
+networkingMode=mirrored
+
+Return .wslconfig to:
+[wsl2]
+memory=8GB
+kernelCommandLine=vsyscall=emulate
+localhostForwarding=true
+
+Then:
+podman machine stop
+wsl --shutdown
+podman machine start
+
+
+============================================================
+9. PODMAN USER-MODE NETWORKING
+============================================================
+
+At one point Podman startup showed:
+Starting user-mode networking...
+
+We tried:
+podman machine set --user-mode-networking=true
+
+This introduced an extra Podman user-mode networking path.
+
+Later recommendation:
+Return to normal WSL networking:
+podman machine stop
+podman machine set --user-mode-networking=false
+wsl --shutdown
+podman machine start
+
+A possible helper distro to check:
+wsl -l -v
+
+If a leftover helper distro named:
+podman-net-usermode
+
+exists, it may be a helper used for user-mode networking.
+
+Important warning:
+Do NOT unregister podman-machine-default because that is the actual Podman machine/data VM.
+
+
+============================================================
+10. WORKING LOCALHOST FIX: NETSH PORTPROXY
+============================================================
+
+Because:
+http://172.27.125.207:8086/ worked
+but:
+http://localhost:8086/ did not
+
+The confirmed working workaround was Windows netsh portproxy.
+
+Run PowerShell as Administrator:
+
+netsh interface portproxy add v4tov4 `
+  listenaddress=127.0.0.1 `
+  listenport=8086 `
+  connectaddress=172.27.125.207 `
+  connectport=8086
+
+Check:
+netsh interface portproxy show all
+
+Then:
+http://localhost:8086
+
+CONFIRMED:
+This workaround worked.
+
+Why use 127.0.0.1 instead of 0.0.0.0?
+127.0.0.1 = local machine only
+0.0.0.0   = may listen on additional host interfaces
+
+Limitation:
+The WSL/Podman VM IP (172.27.125.207) can change after restart.
+If it changes, the portproxy rule must be updated.
+
+Also:
+One portproxy rule is needed per host port if the automatic localhost forwarding remains broken.
+
+Examples:
+5432 -> PostgreSQL
+8086 -> Adminer
+3000 -> application
+
+
+============================================================
+11. VIEW / DELETE PORTPROXY RULES
+============================================================
+
+Show all rules:
+netsh interface portproxy show all
+
+Delete one rule:
+netsh interface portproxy delete v4tov4 `
+  listenaddress=127.0.0.1 `
+  listenport=8086
+
+Example to recreate with a new WSL IP:
+netsh interface portproxy add v4tov4 `
+  listenaddress=127.0.0.1 `
+  listenport=8086 `
+  connectaddress=<CURRENT_WSL_IP> `
+  connectport=8086
+
+
+============================================================
+12. HOW TO GET CURRENT PODMAN VM IP
+============================================================
+
+Inside:
+podman machine ssh
+
+Then:
+ip -4 addr
+
+Look for eth0.
+
+Observed example:
+eth0 -> 172.27.125.207/20
+
+Do NOT use:
+127.0.0.1
+10.88.x.x podman bridge
+10.89.x.x custom pgnet bridge
+
+For Windows-to-VM direct testing, use the eth0 WSL address.
+
+
+============================================================
+13. WINDOWS PORT OCCUPANCY CHECKS
+============================================================
+
+Check port 5432:
+Get-NetTCPConnection -LocalPort 5432 -ErrorAction SilentlyContinue
+
+Detailed process:
+Get-NetTCPConnection -LocalPort 5432 -ErrorAction SilentlyContinue |
+Select-Object LocalAddress,LocalPort,State,OwningProcess,
+@{N="Process";E={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}}
+
+Alternative:
+netstat -ano | findstr :5432
+
+Same idea can be used for 8080, 8086, 3000, etc.
+
+
+============================================================
+14. IMPORTANT CURRENT ARCHITECTURE
+============================================================
+
+Current container connectivity should be:
+
+Windows
+  |
+  | localhost:5432
+  v
+PostgreSQL published port
+
+Windows
+  |
+  | localhost:8086
+  | (currently via netsh portproxy if automatic WSL localhost forwarding is broken)
+  v
+Adminer published port
+
+Adminer container
+  |
+  | pgnet
+  | DNS resolves "goofy_hodgkin"
+  v
+PostgreSQL container:5432
+
+
+============================================================
+15. CURRENT CONTAINER NAMES SEEN IN THIS CONVERSATION
+============================================================
+
+PostgreSQL:
+goofy_hodgkin
+
+Current Adminer seen later:
+mystifying_goldwasser
+
+Older Adminer container name that no longer existed:
+modest_montalcini
+
+This error confirmed the old Adminer name was gone:
+Error: no such object: "modest_montalcini"
+
+
+============================================================
+16. MOST IMPORTANT FINAL FIXES
+============================================================
+
+A. Adminer -> PostgreSQL
+Problem:
+Adminer could not connect using localhost or PostgreSQL container name.
+
+Root cause:
+Default Podman network had DNS disabled.
+
+Fix:
+podman network connect pgnet goofy_hodgkin
+podman network connect pgnet mystifying_goldwasser
+
+Adminer Server:
+goofy_hodgkin
+
+
+B. Windows -> Adminer localhost
+Problem:
+Podman published 8086, direct VM IP worked, localhost did not.
+
+Confirmed working fix:
+netsh interface portproxy add v4tov4 `
+  listenaddress=127.0.0.1 `
+  listenport=8086 `
+  connectaddress=172.27.125.207 `
+  connectport=8086
+
+
+C. Mirrored WSL networking
+Problem:
+networkingMode=mirrored caused WSL startup/network configuration failure.
+
+Fix:
+Remove networkingMode=mirrored from .wslconfig.
+
+
+D. Netavark/nftables
+Problem:
+Containers on pgnet initially failed to start because Netavark could not apply nftables rules.
+
+Useful recovery:
+podman machine stop
+wsl --shutdown
+podman machine start
+
+If it returns, inspect from:
+podman machine ssh
+sudo nft list ruleset
+
+
+============================================================
+17. QUICK DIAGNOSTIC COMMAND SET
+============================================================
+
+Podman status:
+podman machine list
+podman ps -a
+
+Networks:
+podman network ls
+podman network inspect podman
+podman network inspect pgnet
+
+Containers + networks + ports:
+podman ps --format "table {{.Names}}\t{{.Networks}}\t{{.Ports}}"
+
+Default network DNS:
+podman network inspect podman --format "{{.DNSEnabled}}"
+
+Adminer -> Postgres DNS:
+podman exec mystifying_goldwasser getent hosts goofy_hodgkin
+
+Adminer -> Postgres TCP:
+podman exec mystifying_goldwasser php -r "var_dump(@fsockopen('goofy_hodgkin',5432));"
+
+Windows -> PostgreSQL:
+Test-NetConnection 127.0.0.1 -Port 5432
+
+Windows -> Adminer:
+Test-NetConnection 127.0.0.1 -Port 8086
+curl.exe http://127.0.0.1:8086
+
+Portproxy:
+netsh interface portproxy show all
+
+Podman VM networking:
+podman machine ssh
+ip -4 addr
+
+
+============================================================
+18. NOTE ABOUT WHAT WAS CONFIRMED VS ATTEMPTED
+============================================================
+
+CONFIRMED:
+- PostgreSQL was reachable on Windows localhost:5432.
+- Adminer container was running and port was published.
+- Adminer worked when accessed through the Podman VM IP.
+- Default "podman" network had DNSEnabled=false.
+- pgnet had dns_enabled=true.
+- Adminer -> goofy_hodgkin test returned bool(false) before pgnet attachment.
+- netsh portproxy fixed Windows localhost access.
+- networkingMode=mirrored broke WSL startup in this environment.
+
+ATTEMPTED / NOT RELIED ON AS FINAL FIX:
+- podman network reload --all from Windows remote client (unsupported).
+- user-mode networking changes.
+- mirrored WSL networking.
+- normal localhostForwarding alone did not solve the issue in this setup.
+
+============================================================
+END
+============================================================
