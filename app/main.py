@@ -5,8 +5,6 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 import psycopg
 from psycopg.rows import dict_row
@@ -14,13 +12,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from app.foundry_client import FoundryError, foundry_reply
+
+FOUNDRY_MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
 
 app = FastAPI(title="Pulse Markets API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 DATABASE_URL = os.getenv("DATABASE_URL")
-OLLAMA_CHAT_URL = os.getenv("OLLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))
 MASTER = os.getenv("PULSE_MASTER_EMAIL", "master@pulse.local").strip().lower()
 ROLES = {"master": {"*"}, "admin": {"users:write", "roles:write", "permissions:write", "quotes:read", "trades:write"}, "analyst": {"quotes:read", "trades:write"}, "viewer": {"quotes:read", "trades:write"}, "customer": {"quotes:read", "trades:write"}}
 quotes = {"AAPL": {"name": "Apple Inc.", "price": 218.74, "open": 217.20}, "MSFT": {"name": "Microsoft Corp.", "price": 451.62, "open": 448.91}, "NVDA": {"name": "NVIDIA Corp.", "price": 141.93, "open": 143.26}, "TSLA": {"name": "Tesla Inc.", "price": 326.15, "open": 320.84}, "AMZN": {"name": "Amazon.com Inc.", "price": 227.88, "open": 226.44}}
@@ -127,14 +125,17 @@ def execute_order(db, user_id, order):
         db.execute("UPDATE portfolios SET cash=cash+%s WHERE user_id=%s",(total,user_id)); db.execute("DELETE FROM holdings WHERE user_id=%s AND symbol=%s",(user_id,order.symbol)) if hold["shares"]==order.quantity else db.execute("UPDATE holdings SET shares=shares-%s WHERE user_id=%s AND symbol=%s",(order.quantity,user_id,order.symbol))
     oid=secrets.token_hex(8); at=datetime.now(timezone.utc); db.execute("INSERT INTO transactions(id,user_id,side,symbol,quantity,price,total,executed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",(oid,user_id,order.side,order.symbol,order.quantity,price,total,at)); return {"id":oid,"side":order.side,"symbol":order.symbol,"quantity":order.quantity,"price":price,"total":total,"executed_at":at.isoformat()},portfolio(db,user_id)
 
-def ollama_reply(ctx, message):
+def portfolio_reply(ctx, message):
     system_prompt="""You are a concise local paper-trading portfolio assistant. Use only supplied data; never claim execution.
 
 For P/L calculations: total account value is cash plus holdings value. Overall P/L is total account value minus initial_funding. Unrealized P/L is holdings market value minus holdings cost basis. Realized P/L is overall P/L minus unrealized P/L. Never subtract current holdings cost basis from total account value, because that incorrectly counts cash as profit. When asked for performance, show initial funding, cash, holdings value, total account value, overall P/L and percentage, realized P/L, unrealized P/L, and each holding's cost basis, market value, and unrealized P/L. The supplied transactions list is the authoritative record for buy and sell history; use it to answer trade-history questions and never infer that current holdings mean no prior sales."""
-    payload={"model":OLLAMA_MODEL,"stream":False,"messages":[{"role":"system","content":system_prompt},{"role":"user","content":f"Context: {json.dumps(ctx)}\nQuestion: {message}"}]}
-    with urlopen(Request(OLLAMA_CHAT_URL,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST"),timeout=OLLAMA_TIMEOUT_SECONDS) as r: answer=json.loads(r.read().decode()).get("message",{}).get("content","").strip()
-    if not answer: raise ValueError("Empty Ollama response")
-    return answer
+    return foundry_reply([
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Context: {json.dumps(ctx)}\nQuestion: {message}",
+        },
+    ])
 
 @app.post("/api/auth/register",status_code=201)
 def register(p: RegisterCustomer):
@@ -195,23 +196,34 @@ def chat(p:AssistantQuestion,u:Annotated[dict,Depends(require_permission("trades
     if show_performance: answer="Here is your current portfolio performance."; mode="calculated"
     elif trades: answer=f"Here are your {trades['title'].lower()}."; mode="calculated"
     else:
-        try: answer=ollama_reply(ctx,p.message); mode="ollama"
-        except (URLError,TimeoutError,ValueError,json.JSONDecodeError,OSError): answer=f"Your portfolio is worth ${ctx['portfolio']['total_value']:,.2f}."; mode="fallback"
+        try: answer=portfolio_reply(ctx,p.message); mode="foundry"
+        except FoundryError as error: raise HTTPException(503, "Foundry assistant is unavailable") from error
     with db_connection() as db: db.execute("INSERT INTO assistant_messages(user_id,conversation_id,role,content) VALUES (%s,%s,%s,%s),(%s,%s,%s,%s)",(u["id"],cid,"user",p.message.strip(),u["id"],cid,"assistant",answer)); db.execute("UPDATE assistant_conversations SET updated_at=NOW() WHERE id=%s",(cid,))
-    return {"answer":answer,"conversation_id":cid,"mode":mode,"model":OLLAMA_MODEL if mode=="ollama" else None,"performance":performance_summary(ctx) if show_performance else None,"transactions":trades}
+    return {"answer":answer,"conversation_id":cid,"mode":mode,"model":FOUNDRY_MODEL if mode=="foundry" else None,"performance":performance_summary(ctx) if show_performance else None,"transactions":trades}
 
 @app.post("/api/assistant/proposals",status_code=201)
 @private_api("trades:write","Ask the local agent to propose a confirmation-gated paper trade")
 def proposal(p:ProposalRequest,u:Annotated[dict,Depends(require_permission("trades:write"))]):
     with db_connection() as db: ctx=context(db,u["id"])
-    payload={"model":OLLAMA_MODEL,"stream":False,"format":"json","messages":[{"role":"system","content":"Return JSON only: side, symbol, quantity, rationale. Use only supplied data. Proposal only; never execute."},{"role":"user","content":f"{json.dumps(ctx)}\n{p.message}"}]}
     try:
-        with urlopen(Request(OLLAMA_CHAT_URL,data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST"),timeout=OLLAMA_TIMEOUT_SECONDS) as r: draft=ProposalDraft.model_validate_json(json.loads(r.read().decode())["message"]["content"])
-        if draft.symbol not in quotes: raise ValueError()
-    except Exception as e: raise HTTPException(503,"Local agent could not create a valid proposal") from e
+        answer = foundry_reply([
+            {
+                "role": "system",
+                "content": "Return JSON only: side, symbol, quantity, rationale. Use only supplied data. Proposal only; never execute.",
+            },
+            {
+                "role": "user",
+                "content": f"{json.dumps(ctx)}\n{p.message}",
+            },
+        ], json_mode=True)
+        draft = ProposalDraft.model_validate_json(answer)
+        if draft.symbol not in quotes:
+            raise ValueError("Unknown stock symbol")
+    except (FoundryError, ValueError) as error:
+        raise HTTPException(503, "Foundry could not create a valid proposal") from error
     pid=secrets.token_hex(16); expires=datetime.now(timezone.utc)+timedelta(minutes=10); price=quotes[draft.symbol]["price"]
     with db_connection() as db: db.execute("INSERT INTO trade_proposals(id,user_id,side,symbol,quantity,estimated_price,rationale,status,expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s)",(pid,u["id"],draft.side,draft.symbol,draft.quantity,price,draft.rationale,expires))
-    return {"proposal":{"id":pid,"side":draft.side,"symbol":draft.symbol,"quantity":draft.quantity,"estimated_price":price,"estimated_total":round(price*draft.quantity,2),"rationale":draft.rationale,"status":"pending","expires_at":expires.isoformat()},"model":OLLAMA_MODEL}
+    return {"proposal":{"id":pid,"side":draft.side,"symbol":draft.symbol,"quantity":draft.quantity,"estimated_price":price,"estimated_total":round(price*draft.quantity,2),"rationale":draft.rationale,"status":"pending","expires_at":expires.isoformat()},"model":FOUNDRY_MODEL}
 @app.post("/api/assistant/proposals/confirm",status_code=201)
 @private_api("trades:write","Confirm one pending agent paper-trade proposal")
 def confirm(p:ProposalConfirmation,u:Annotated[dict,Depends(require_permission("trades:write"))]):

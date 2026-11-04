@@ -175,7 +175,7 @@ function History({ headers, onLogout }) {
 }
 
 function Assistant({ headers, onLogout }) {
-  const welcome = { role: "assistant", text: "I use local gpt-oss with your saved portfolio context. Ask for analysis, or request a paper-trade proposal. Nothing executes without your confirmation." };
+  const welcome = { role: "assistant", text: "I use Foundry gpt-5-mini with your saved portfolio context. Ask for analysis, or request a paper-trade proposal. Nothing executes without your confirmation." };
   const [conversations, setConversations] = useState([]), [selectedId, setSelectedId] = useState(null);
   const [messages, setMessages] = useState([welcome]);
   const [question, setQuestion] = useState(""), [loading, setLoading] = useState(false);
