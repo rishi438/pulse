@@ -211,3 +211,30 @@ applies_to: cwd=C:\Users\AMD\OneDrive\Desktop\test\MCP\stock-dashboard; reuse_ru
 - Native Selectize fallback -> CDN assets did not load; use `cdnjs.cloudflare.com/ajax/libs/selectize.js/0.15.2` and hard-refresh. [Task 1]
 - Combined `node --check ...; git diff ...` failed because the directory was not a Git root -> run validation and repository commands separately from the correct directory. [Task 2]
 
+
+
+## 2026-11-04: direct Pulse logging
+
+- Added `app/observability.py` and `web/observability.js` from the prepared reference,
+  adapted browser instrumentation to preserve all business headers (no injected ID).
+  Backend returns UUID `X-Request-ID`; browser correlates via response/caller ID.
+- Installed after CORS registration in `app/main.py` (telemetry wraps CORS);
+  ingestion route precedes catch-all static mount. Script precedes third-party JS.
+  Foundry and confirmation-gated paper trading source preserved.
+- Metadata-only JSON stdout, full-response timing, safe HTTP failures, strict 2 KiB
+  client ingestion, 120/minute/app-process and 20/minute/page-instance bounds.
+  Browser events are untrusted. No incident-drill adapter or external delivery.
+- Dockerfile disables access logs; Compose rotates app json-file logs at 10m x 3.
+  Manual Uvicorn launches also need `--no-access-log` (see README).
+- Verified hash-matched original backups in `.codex/backups/20261104-080958-logging`.
+  Original local bytecode files retained; 3,593 tracked Python cache files were
+  subsequently untracked at user request. Handoff remains untracked.
+- Validation: 18 Python tests passed with `python -B -m unittest discover -s
+  tests/observability -p "test_*.py" -v`; `npm run test:logging` passed 16 Node
+  contracts; `npm run test:logging:browser` passed one real Chromium synthetic
+  local-server test. Pulse wiring test substitutes provider import because local
+  Azure SDK is missing, blocks DB calls, and does not run lifespan.
+- No full app/identity/trading E2E, VM deployment/restart, or Docker build/runtime
+  verification. Docker and Ruff are unavailable locally. Existing E2E runner still
+  assumes Ollama and must be revised before Foundry regression testing. Deploy
+  interactively one VM step at a time when requested; never delete database volumes.

@@ -2,7 +2,9 @@
   "name": "pulse-markets-e2e",
   "private": true,
   "scripts": {
-    "test:e2e": "node scripts/run-e2e.js"
+    "test:e2e": "node scripts/run-e2e.js",
+    "test:logging": "node --test tests/observability/frontend.test.cjs",
+    "test:logging:browser": "node --test tests/observability/browser.test.cjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0"

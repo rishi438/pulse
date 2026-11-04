@@ -18,11 +18,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from app.foundry_client import FoundryError, foundry_reply
+from app.observability import install_observability
 
 FOUNDRY_MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
 
 app = FastAPI(title="Pulse Markets API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+install_observability(app, service_name="pulse", slow_ms=1000)
 DATABASE_URL = os.getenv("DATABASE_URL")
 MASTER = os.getenv("PULSE_MASTER_EMAIL", "master@pulse.local").strip().lower()
 ROLES = {"master": {"*"}, "admin": {"users:write", "roles:write", "permissions:write", "quotes:read", "trades:write"}, "analyst": {"quotes:read", "trades:write"}, "viewer": {"quotes:read", "trades:write"}, "customer": {"quotes:read", "trades:write"}}

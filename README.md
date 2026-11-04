@@ -200,3 +200,57 @@ The test runner uses port `8082` and deliberately disables Ollama calls for dete
 - Trade execution is paper-only. AI proposals remain pending until the signed-in owner explicitly confirms them.
 
 For implementation history and current design notes, see [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md).
+
+## Application logging
+
+Pulse now emits metadata-only JSON events to stdout via `app/observability.py`.
+`backend_request` contains UTC time, service, matched route template (or a fixed
+unknown-route label), method, status, response duration, slow/completed flags,
+and a validated or generated UUID. Responses include `X-Request-ID`. Timing ends
+at the final response body, including streams, and excludes later background work.
+Unhandled HTTP failures return a generic 500; interrupted streams retain a sanitized
+transport failure. Cancellation and lifespan failures propagate.
+
+`web/observability.js` loads before jQuery and reports failed/slow same-origin API
+fetch/XHR calls, JS errors, promise rejections, and resource failures. Slow means
+at least 1000 ms. Fetch measures time to headers; XHR measures completion. Business
+headers, bodies, responses, and cancellation signals remain unchanged. Correlation
+uses the response ID; network failures without a response/caller ID cannot correlate.
+Browser reports contain fixed route groups/error categories, never raw URLs,
+messages, stacks, headers, cookies, chat content, or request/response bodies.
+
+`POST /api/client-events` accepts only allowlisted JSON metadata, rejects unknown
+fields and bodies over 2048 bytes, and permits 120 ingestion requests/minute per
+app process. The browser script permits 20 reports/minute per page instance, with
+no retries and a five-second timeout. These limits are neither distributed nor
+per authenticated user. Reports carry `trust=client_reported`; their
+`related_request_id` refers to the original API request, while `request_id` refers
+to ingestion. Client reports cannot authorize remediation. Inspect best-effort
+browser counters with `window.PulseTelemetry.stats()`.
+
+The Docker command disables raw Uvicorn access logging. For manual launches use:
+
+```powershell
+.venv/Scripts/python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8081 --no-access-log
+```
+
+Compose bounds app logs with `json-file`, `max-size: 10m`, and `max-file: 3`.
+Inspect deployed logs with `docker compose logs --tail 100 app`. Rotation limits
+local disk usage; it provides no durable external storage. Existing library logs
+and non-HTTP startup failures require separate privacy review. These events are
+not connected to incident-drill agents.
+
+Focused validation (no database, identity calls, orders, or external services):
+
+```powershell
+.venv/Scripts/python.exe -B -m unittest discover -s tests/observability -p "test_*.py" -v
+npm run test:logging
+npm run test:logging:browser
+```
+
+The Python Pulse wiring test substitutes the Foundry module and blocks database
+calls; it does not validate the provider. The Chromium test uses a synthetic local
+HTTP server. Install Chromium with `npx playwright install chromium` if needed.
+Full Pulse login/trading regression, Docker build/Compose runtime, and VM deployment
+remain separate checks. The existing E2E runner still targets the historical
+Ollama fallback and must be adapted before using it to validate Foundry behavior.
