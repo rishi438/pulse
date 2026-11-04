@@ -1,14 +1,19 @@
+"""Pulse Markets FastAPI application backend.
+
+Handles authentication, role-based access control, paper trading, portfolio
+management, transaction history, and local AI assistant integration.
+"""
 from __future__ import annotations
 
 import hashlib, json, os, random, secrets
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -39,6 +44,7 @@ def database_connection():
         "port": int(os.getenv("PGPORT", "5432")),
         "dbname": os.getenv("PGDATABASE", "pulsedb"),
         "user": os.getenv("PGUSER", "pulse"),
+        "connect_timeout": int(os.getenv("PGCONNECT_TIMEOUT", "2")),
     }
     password = secret_value("DATABASE_PASSWORD")
     if password: options["password"] = password
@@ -46,6 +52,14 @@ def database_connection():
 
 @contextmanager
 def db_connection():
+    """Context manager providing an active PostgreSQL database connection.
+
+    Yields:
+        psycopg.Connection: Database connection with dict_row row factory.
+
+    Raises:
+        HTTPException: 503 error if the PostgreSQL database is unavailable.
+    """
     try:
         with database_connection() as db: yield db
     except psycopg.OperationalError as error: raise HTTPException(503, "PostgreSQL is unavailable") from error
@@ -61,6 +75,17 @@ def roles_for(db, user_id): return {r["role_name"] for r in db.execute("SELECT r
 def public_user(user): return {"id": user["id"], "email": user["email"], "roles": sorted(user["roles"])}
 
 def require_user(authorization: Annotated[str | None, Header()] = None):
+    """Authenticate a user by inspecting the Bearer token in the Authorization header.
+
+    Args:
+        authorization (str | None): HTTP Authorization header value.
+
+    Returns:
+        dict: User row from the database with attached user roles.
+
+    Raises:
+        HTTPException: 401 error if the token is missing, invalid, or expired.
+    """
     token = authorization.removeprefix("Bearer ") if authorization else ""
     with db_connection() as db:
         row = db.execute("SELECT u.id,u.email,u.password_hash FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=%s", (token,)).fetchone()
@@ -88,6 +113,18 @@ class CreateRole(RolePermissions): name: str = Field(pattern=r"^[a-z][a-z0-9_-]{
 class UpdateUser(BaseModel): email: str | None = None; password: str | None = Field(None, min_length=8); roles: set[str] | None = None
 
 def portfolio(db, user_id):
+    """Calculate and return the current paper trading portfolio for a user.
+
+    Initializes the user's paper portfolio with $100,000 cash if not already created,
+    then aggregates cash, holdings, and total portfolio valuation against live simulated quotes.
+
+    Args:
+        db: Active database connection.
+        user_id (int): ID of the user.
+
+    Returns:
+        dict: Portfolio data with cash, holdings_value, total_value, and holdings list.
+    """
     db.execute("INSERT INTO portfolios(user_id,cash) VALUES (%s,100000) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cash = float(db.execute("SELECT cash FROM portfolios WHERE user_id=%s", (user_id,)).fetchone()["cash"]); holdings=[]
     for h in db.execute("SELECT symbol,shares,average_cost FROM holdings WHERE user_id=%s ORDER BY symbol", (user_id,)):
@@ -279,26 +316,51 @@ CREATE TABLE IF NOT EXISTS assistant_conversations(id BIGINT GENERATED ALWAYS AS
 CREATE TABLE IF NOT EXISTS assistant_messages(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,conversation_id BIGINT REFERENCES assistant_conversations(id) ON DELETE CASCADE,role TEXT NOT NULL,content TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS trade_proposals(id TEXT PRIMARY KEY,user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,side TEXT NOT NULL,symbol TEXT NOT NULL,quantity INTEGER NOT NULL,estimated_price NUMERIC(14,2) NOT NULL,rationale TEXT NOT NULL,status TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,order_id TEXT REFERENCES transactions(id));
 """
-@app.on_event("startup")
-def startup():
-    with db_connection() as db:
-        db.execute(SCHEMA)
-        for role,permissions in ROLES.items():
-            db.execute("INSERT INTO roles(name,built_in) VALUES (%s,true) ON CONFLICT(name) DO NOTHING",(role,))
-            for permission in permissions: db.execute("INSERT INTO role_permissions(role_name,permission) VALUES (%s,%s) ON CONFLICT DO NOTHING",(role,permission))
-        bootstrap_users = [(MASTER, secret_value("PULSE_MASTER_PASSWORD"), "master")]
-        admin_email = os.getenv("PULSE_ADMIN_EMAIL", "").strip().lower()
-        if admin_email: bootstrap_users.append((admin_email, secret_value("PULSE_ADMIN_PASSWORD"), "admin"))
-        reset_passwords = os.getenv("PULSE_RESET_BOOTSTRAP_PASSWORDS", "").lower() in {"1", "true", "yes"}
-        for email,password,role in bootstrap_users:
-            if not password: continue
-            if len(password) < 12: raise RuntimeError(f"{role} bootstrap password must be at least 12 characters")
-            user = db.execute("SELECT id FROM users WHERE lower(email)=lower(%s)",(email,)).fetchone()
-            if user:
-                uid = user["id"]
-                if reset_passwords: db.execute("UPDATE users SET password_hash=%s WHERE id=%s",(password_hash(password),uid))
-            else:
-                uid=db.execute("INSERT INTO users(email,password_hash) VALUES (%s,%s) RETURNING id",(email,password_hash(password))).fetchone()["id"]
-            db.execute("INSERT INTO user_roles VALUES (%s,%s) ON CONFLICT DO NOTHING",(uid,role))
-            db.execute("INSERT INTO portfolios VALUES (%s,100000) ON CONFLICT DO NOTHING",(uid,))
+def initialize_database():
+    try:
+        with db_connection() as db:
+            db.execute(SCHEMA)
+            for role,permissions in ROLES.items():
+                db.execute("INSERT INTO roles(name,built_in) VALUES (%s,true) ON CONFLICT(name) DO NOTHING",(role,))
+                for permission in permissions: db.execute("INSERT INTO role_permissions(role_name,permission) VALUES (%s,%s) ON CONFLICT DO NOTHING",(role,permission))
+            bootstrap_users = [(MASTER, secret_value("PULSE_MASTER_PASSWORD"), "master")]
+            admin_email = os.getenv("PULSE_ADMIN_EMAIL", "").strip().lower()
+            if admin_email: bootstrap_users.append((admin_email, secret_value("PULSE_ADMIN_PASSWORD"), "admin"))
+            reset_passwords = os.getenv("PULSE_RESET_BOOTSTRAP_PASSWORDS", "").lower() in {"1", "true", "yes"}
+            for email,password,role in bootstrap_users:
+                if not password: continue
+                if len(password) < 12: raise RuntimeError(f"{role} bootstrap password must be at least 12 characters")
+                user = db.execute("SELECT id FROM users WHERE lower(email)=lower(%s)",(email,)).fetchone()
+                if user:
+                    uid = user["id"]
+                    if reset_passwords: db.execute("UPDATE users SET password_hash=%s WHERE id=%s",(password_hash(password),uid))
+                else:
+                    uid=db.execute("INSERT INTO users(email,password_hash) VALUES (%s,%s) RETURNING id",(email,password_hash(password))).fetchone()["id"]
+                db.execute("INSERT INTO user_roles VALUES (%s,%s) ON CONFLICT DO NOTHING",(uid,role))
+                db.execute("INSERT INTO portfolios VALUES (%s,100000) ON CONFLICT DO NOTHING",(uid,))
+    except Exception:
+        pass
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    initialize_database()
+    from .mcp_server import get_mcp_session_manager
+    async with get_mcp_session_manager().run():
+        yield
+
+app.router.lifespan_context = lifespan
+
+class LazyMCPApp:
+    def __init__(self):
+        self._app = None
+    async def __call__(self, scope, receive, send):
+        if self._app is None:
+            from .mcp_server import get_mcp_asgi_app
+            self._app = get_mcp_asgi_app()
+        await self._app(scope, receive, send)
+
+_lazy_mcp = LazyMCPApp()
+app.add_route("/mcp", _lazy_mcp, methods=["GET", "POST", "DELETE", "OPTIONS"])
+app.mount("/mcp", _lazy_mcp)
+
 app.mount("/",StaticFiles(directory=Path(__file__).parent.parent/"web",html=True),name="web")

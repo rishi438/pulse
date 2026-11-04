@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "playwright-page-checker": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\AMD\\OneDrive\\Desktop\\win_co\\MCP\\dist\\index.js"
+      ]
+    },
+    "pulse-markets": {
+      "command": "C:\\Users\\AMD\\OneDrive\\Desktop\\win_co\\MCP\\stock-dashboard\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "app.mcp_server"
+      ],
+      "env": {
+        "PYTHONPATH": "C:\\Users\\AMD\\OneDrive\\Desktop\\win_co\\MCP\\stock-dashboard",
+        "PULSE_MCP_TOKEN": "KlOE5Jq9bHZFoeHjsmvsynfyLIEJqkrm6vFXTTZCxzU",
+        "PGHOST": "127.0.0.1",
+        "PGPORT": "5432",
+        "PGDATABASE": "pulsedb",
+        "PGUSER": "pulse",
+        "DATABASE_PASSWORD_FILE": "C:\\Users\\AMD\\OneDrive\\Desktop\\win_co\\MCP\\stock-dashboard\\secrets\\postgres_password.txt"
+      }
+    }
+  }
+}
+
